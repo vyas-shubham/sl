@@ -1,0 +1,33 @@
+# Simple Makefile for SL documentation generation
+# This can be used independently of the main build system
+
+.PHONY: docs clean-docs help
+
+# Default target
+help:
+	@echo "Available targets:"
+	@echo "  docs       - Generate Doxygen documentation"
+	@echo "  clean-docs - Clean generated documentation"
+	@echo "  help       - Show this help message"
+
+# Generate documentation
+docs:
+	@echo "Generating Doxygen documentation..."
+	@if ! command -v doxygen >/dev/null 2>&1; then \
+		echo "Error: doxygen not found. Please install it first:"; \
+		echo "  sudo apt-get install doxygen graphviz"; \
+		exit 1; \
+	fi
+	@if [ ! -f doc/Doxyfile.standalone ]; then \
+		echo "Error: doc/Doxyfile.standalone not found"; \
+		exit 1; \
+	fi
+	doxygen doc/Doxyfile.standalone
+	@echo "Documentation generated successfully!"
+	@echo "HTML documentation: doc/html/html/index.html"
+
+# Clean generated documentation
+clean-docs:
+	@echo "Cleaning generated documentation..."
+	@rm -rf doc/html/
+	@echo "Documentation cleaned."
