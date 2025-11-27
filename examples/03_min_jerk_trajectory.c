@@ -285,8 +285,18 @@ int main(int argc, char **argv) {
     SL_DJstate *joint_des_state;
     SL_DJstate *joint_goal_state;
     
-    joint_des_state = (SL_DJstate *)my_calloc(EXAMPLE_N_DOFS + 1, sizeof(SL_DJstate), MY_STOP);
-    joint_goal_state = (SL_DJstate *)my_calloc(EXAMPLE_N_DOFS + 1, sizeof(SL_DJstate), MY_STOP);
+    joint_des_state = (SL_DJstate *)calloc(EXAMPLE_N_DOFS + 1, sizeof(SL_DJstate));
+    if (joint_des_state == NULL) {
+        printf("Error: Memory allocation failed for joint_des_state\n");
+        return 1;
+    }
+    
+    joint_goal_state = (SL_DJstate *)calloc(EXAMPLE_N_DOFS + 1, sizeof(SL_DJstate));
+    if (joint_goal_state == NULL) {
+        printf("Error: Memory allocation failed for joint_goal_state\n");
+        free(joint_des_state);
+        return 1;
+    }
     
     /* Initialize states (note: 1-indexed like SL) */
     double targets[] = {0, PI / 4, PI / 3, PI / 6};  /* 45, 60, 30 degrees */
