@@ -10,567 +10,309 @@
   \remarks
 
   Example demonstrating real-time inter-process communication (IPC) as used
-  in the SL library with PREEMPT-RT Linux.
+  in the SL library with PREEMPT-RT Linux or Xenomai.
   
-  This example simulates the architecture of a typical SL robot control system
-  with three communicating processes:
+  This example shows the SL servo architecture with three communicating
+  processes:
   
-  1. MOTOR SERVO: High-frequency control loop (1000 Hz)
+  1. MOTOR SERVO: High-frequency control loop (typically 1000 Hz)
      - Reads joint commands from shared memory
-     - Simulates motor control and sensor reading
+     - Applies motor control and reads sensors
      - Writes sensor data to shared memory
   
-  2. TASK SERVO: Medium-frequency task execution (500 Hz)
+  2. TASK SERVO: Medium-frequency task execution (typically 500 Hz)
      - Computes desired trajectories
      - Writes joint commands to shared memory
      - Reads sensor feedback
   
-  3. VISUALIZATION: Low-frequency display (60 Hz)
+  3. OPENGL SERVO: Low-frequency visualization (60 Hz)
      - Reads state from shared memory
      - Displays robot state
 
-  Key IPC concepts demonstrated:
-  - POSIX shared memory for data exchange
-  - Mutexes for thread-safe access
-  - Condition variables for synchronization
-  - Lock-free techniques for real-time safety
-  - Timestamp-based data freshness
+  Key SL IPC concepts demonstrated:
+  - Shared memory structures (smJointStates, smJointDesStates, etc.)
+  - Semaphore synchronization
+  - Message passing between servos
+  - SL_rt_mutex for real-time safe synchronization
 
-  This example can be compiled and run on any Linux system. On PREEMPT-RT
-  or Xenomai systems, it would use the real-time primitives from SL_rt_mutex.h.
+  Compile with:
+    gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR -o 05_realtime_ipc \
+        05_realtime_ipc.c -lSLcommon -lutility -lpthread -lm
 
   ============================================================================*/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <sys/time.h>
-#include <signal.h>
-#include <errno.h>
+// SL general includes of system headers
+#include "SL_system_headers.h"
+
+// SL specific headers
+#include "SL.h"
+#include "SL_shared_memory.h"
+#include "SL_rt_mutex.h"
+#include "utility.h"
 
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
 
-/* Number of simulated DOFs */
-#define N_DOFS 3
+/* Number of simulated DOFs for this example */
+#define EXAMPLE_N_DOFS 3
 
-/* Servo frequencies (Hz) */
+/* Servo frequencies (Hz) - typical SL values */
 #define MOTOR_SERVO_RATE   1000
 #define TASK_SERVO_RATE    500
 #define DISPLAY_RATE       60
 
-/* Run time in seconds */
-#define RUN_TIME_SECONDS   3
-
-/*============================================================================
- * Data Structures (matching SL conventions)
- *============================================================================*/
-
 /**
- * \brief Joint state structure (matches SL_fJstate)
- */
-typedef struct {
-    float th;    /**< Joint position (rad) */
-    float thd;   /**< Joint velocity (rad/s) */
-    float thdd;  /**< Joint acceleration (rad/s^2) */
-    float u;     /**< Applied torque (Nm) */
-    float load;  /**< Measured load (Nm) */
-} JointState;
-
-/**
- * \brief Desired joint state structure (matches SL_fDJstate)
- */
-typedef struct {
-    float th;    /**< Desired position (rad) */
-    float thd;   /**< Desired velocity (rad/s) */
-    float thdd;  /**< Desired acceleration (rad/s^2) */
-    float uff;   /**< Feedforward torque (Nm) */
-} DesiredState;
-
-/**
- * \brief Shared memory structure for joint states
- * 
- * This structure is placed in shared memory and protected by a mutex.
- * The timestamp allows consumers to check data freshness.
- */
-typedef struct {
-    pthread_mutex_t mutex;        /**< Mutex for thread-safe access */
-    double timestamp;             /**< Data timestamp (seconds) */
-    unsigned long seq_num;        /**< Sequence number for ordering */
-    JointState joints[N_DOFS];    /**< Joint state array */
-} SharedJointState;
-
-/**
- * \brief Shared memory structure for desired states
- */
-typedef struct {
-    pthread_mutex_t mutex;        /**< Mutex for thread-safe access */
-    double timestamp;             /**< Data timestamp (seconds) */
-    unsigned long seq_num;        /**< Sequence number for ordering */
-    DesiredState desired[N_DOFS]; /**< Desired state array */
-    int new_command;              /**< Flag indicating new command */
-} SharedDesiredState;
-
-/**
- * \brief Synchronization semaphores between servos
- */
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int ready;
-} SyncSemaphore;
-
-/*============================================================================
- * Global Variables
- *============================================================================*/
-
-/* Shared memory regions */
-static SharedJointState g_joint_state;
-static SharedDesiredState g_desired_state;
-
-/* Synchronization primitives */
-static SyncSemaphore g_motor_sync;
-static SyncSemaphore g_task_sync;
-
-/* Control flag for shutdown */
-static volatile int g_running = 1;
-
-/* Statistics */
-static unsigned long g_motor_cycles = 0;
-static unsigned long g_task_cycles = 0;
-static unsigned long g_display_cycles = 0;
-
-/*============================================================================
- * Utility Functions
- *============================================================================*/
-
-/**
- * \brief Get current time in seconds (high resolution)
- */
-double get_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
-}
-
-/**
- * \brief Sleep for specified microseconds
- */
-void sleep_us(unsigned int us) {
-    usleep(us);
-}
-
-/**
- * \brief Initialize a synchronization semaphore
- */
-void init_sync_sem(SyncSemaphore *sem) {
-    pthread_mutex_init(&sem->mutex, NULL);
-    pthread_cond_init(&sem->cond, NULL);
-    sem->ready = 0;
-}
-
-/**
- * \brief Signal a synchronization semaphore
- */
-void signal_sync_sem(SyncSemaphore *sem) {
-    pthread_mutex_lock(&sem->mutex);
-    sem->ready = 1;
-    pthread_cond_signal(&sem->cond);
-    pthread_mutex_unlock(&sem->mutex);
-}
-
-/**
- * \brief Wait on a synchronization semaphore with timeout
- * 
- * \param sem      Semaphore to wait on
- * \param timeout_us Timeout in microseconds
- * \return         0 on success, -1 on timeout
- */
-int wait_sync_sem(SyncSemaphore *sem, unsigned int timeout_us) {
-    struct timespec ts;
-    struct timeval tv;
-    int result = 0;
-    
-    gettimeofday(&tv, NULL);
-    ts.tv_sec = tv.tv_sec + timeout_us / 1000000;
-    ts.tv_nsec = (tv.tv_usec + (timeout_us % 1000000)) * 1000;
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec++;
-        ts.tv_nsec -= 1000000000;
-    }
-    
-    pthread_mutex_lock(&sem->mutex);
-    while (!sem->ready && result == 0) {
-        result = pthread_cond_timedwait(&sem->cond, &sem->mutex, &ts);
-    }
-    sem->ready = 0;
-    pthread_mutex_unlock(&sem->mutex);
-    
-    return (result == ETIMEDOUT) ? -1 : 0;
-}
-
-/*============================================================================
- * Motor Servo (High-frequency control loop)
- *============================================================================*/
-
-/**
- * \brief Motor servo thread function
- * 
- * Simulates a 1000 Hz motor control loop that:
- * - Reads desired state from shared memory
- * - Applies simple PD control
- * - Simulates joint dynamics
- * - Writes sensor data to shared memory
- */
-void *motor_servo_thread(void *arg) {
-    (void)arg;
-    
-    double loop_period = 1.0 / MOTOR_SERVO_RATE;
-    double next_time = get_time() + loop_period;
-    
-    /* Local state variables */
-    JointState state[N_DOFS];
-    DesiredState desired[N_DOFS];
-    
-    /* Initialize state */
-    int i;
-    for (i = 0; i < N_DOFS; i++) {
-        state[i].th = 0.0f;
-        state[i].thd = 0.0f;
-        state[i].thdd = 0.0f;
-        state[i].u = 0.0f;
-        state[i].load = 0.0f;
-        
-        desired[i].th = 0.0f;
-        desired[i].thd = 0.0f;
-        desired[i].thdd = 0.0f;
-        desired[i].uff = 0.0f;
-    }
-    
-    /* PD gains */
-    float Kp = 100.0f;
-    float Kd = 20.0f;
-    float dt = (float)loop_period;
-    
-    printf("[MOTOR] Starting motor servo at %d Hz\n", MOTOR_SERVO_RATE);
-    
-    while (g_running) {
-        double current_time = get_time();
-        
-        /* Read desired state from shared memory (with mutex) */
-        pthread_mutex_lock(&g_desired_state.mutex);
-        memcpy(desired, g_desired_state.desired, sizeof(desired));
-        pthread_mutex_unlock(&g_desired_state.mutex);
-        
-        /* Compute control and simulate dynamics for each joint */
-        for (i = 0; i < N_DOFS; i++) {
-            /* PD control */
-            float error = desired[i].th - state[i].th;
-            float error_d = desired[i].thd - state[i].thd;
-            
-            state[i].u = Kp * error + Kd * error_d + desired[i].uff;
-            
-            /* Simple dynamics simulation: thdd = u / inertia */
-            float inertia = 0.1f;  /* kg*m^2 */
-            state[i].thdd = state[i].u / inertia;
-            
-            /* Integrate */
-            state[i].thd += state[i].thdd * dt;
-            state[i].th += state[i].thd * dt;
-            
-            /* Simulate load sensor (with noise) */
-            state[i].load = state[i].u + 0.01f * ((float)rand() / RAND_MAX - 0.5f);
-        }
-        
-        /* Write state to shared memory */
-        pthread_mutex_lock(&g_joint_state.mutex);
-        g_joint_state.timestamp = current_time;
-        g_joint_state.seq_num++;
-        memcpy(g_joint_state.joints, state, sizeof(state));
-        pthread_mutex_unlock(&g_joint_state.mutex);
-        
-        /* Signal task servo that new data is available */
-        signal_sync_sem(&g_task_sync);
-        
-        g_motor_cycles++;
-        
-        /* Sleep until next cycle */
-        next_time += loop_period;
-        double sleep_time = next_time - get_time();
-        if (sleep_time > 0) {
-            sleep_us((unsigned int)(sleep_time * 1e6));
-        }
-    }
-    
-    printf("[MOTOR] Motor servo stopped after %lu cycles\n", g_motor_cycles);
-    return NULL;
-}
-
-/*============================================================================
- * Task Servo (Medium-frequency task execution)
- *============================================================================*/
-
-/**
- * \brief Task servo thread function
- * 
- * Simulates a 500 Hz task servo that:
- * - Generates minimum-jerk trajectory
- * - Writes desired state to shared memory
- * - Reads sensor feedback for monitoring
- */
-void *task_servo_thread(void *arg) {
-    (void)arg;
-    
-    double loop_period = 1.0 / TASK_SERVO_RATE;
-    double next_time = get_time() + loop_period;
-    double start_time = get_time();
-    
-    /* Trajectory parameters */
-    float target[N_DOFS] = {PI/4, PI/3, PI/6};  /* Target positions */
-    float move_duration = 2.0f;                  /* Movement time */
-    
-    /* Local state */
-    DesiredState desired[N_DOFS];
-    int i;
-    for (i = 0; i < N_DOFS; i++) {
-        desired[i].th = 0.0f;
-        desired[i].thd = 0.0f;
-        desired[i].thdd = 0.0f;
-        desired[i].uff = 0.0f;
-    }
-    
-    printf("[TASK]  Starting task servo at %d Hz\n", TASK_SERVO_RATE);
-    printf("[TASK]  Trajectory: Moving to [%.2f, %.2f, %.2f] rad over %.1f sec\n",
-           target[0], target[1], target[2], move_duration);
-    
-    while (g_running) {
-        double current_time = get_time();
-        double elapsed = current_time - start_time;
-        
-        /* Generate min-jerk trajectory */
-        float tau = (float)(elapsed / move_duration);
-        if (tau > 1.0f) tau = 1.0f;
-        
-        /* Min-jerk polynomial: 10*tau^3 - 15*tau^4 + 6*tau^5 */
-        float s = 10.0f * tau * tau * tau - 15.0f * tau * tau * tau * tau + 
-                  6.0f * tau * tau * tau * tau * tau;
-        float sd = (30.0f * tau * tau - 60.0f * tau * tau * tau + 
-                   30.0f * tau * tau * tau * tau) / (float)move_duration;
-        float sdd = (60.0f * tau - 180.0f * tau * tau + 
-                    120.0f * tau * tau * tau) / (float)(move_duration * move_duration);
-        
-        for (i = 0; i < N_DOFS; i++) {
-            desired[i].th = target[i] * s;
-            desired[i].thd = target[i] * sd;
-            desired[i].thdd = target[i] * sdd;
-            
-            /* Simple gravity compensation as feedforward */
-            desired[i].uff = 0.5f * sinf(desired[i].th);
-        }
-        
-        /* Write desired state to shared memory */
-        pthread_mutex_lock(&g_desired_state.mutex);
-        g_desired_state.timestamp = current_time;
-        g_desired_state.seq_num++;
-        memcpy(g_desired_state.desired, desired, sizeof(desired));
-        g_desired_state.new_command = 1;
-        pthread_mutex_unlock(&g_desired_state.mutex);
-        
-        g_task_cycles++;
-        
-        /* Wait for motor servo or timeout */
-        wait_sync_sem(&g_task_sync, (unsigned int)(loop_period * 1e6 * 2));
-        
-        /* Sleep until next cycle */
-        next_time += loop_period;
-        double sleep_time = next_time - get_time();
-        if (sleep_time > 0) {
-            sleep_us((unsigned int)(sleep_time * 1e6));
-        }
-    }
-    
-    printf("[TASK]  Task servo stopped after %lu cycles\n", g_task_cycles);
-    return NULL;
-}
-
-/*============================================================================
- * Display/Visualization (Low-frequency)
- *============================================================================*/
-
-/**
- * \brief Display thread function
- * 
- * Simulates a 60 Hz visualization that reads state from shared memory.
- */
-void *display_thread(void *arg) {
-    (void)arg;
-    
-    double loop_period = 1.0 / DISPLAY_RATE;
-    double next_time = get_time() + loop_period;
-    double start_time = get_time();
-    
-    printf("[DISP]  Starting display at %d Hz\n", DISPLAY_RATE);
-    printf("\n");
-    
-    while (g_running) {
-        double current_time = get_time();
-        double elapsed = current_time - start_time;
-        
-        /* Read state from shared memory */
-        JointState state[N_DOFS];
-        DesiredState desired[N_DOFS];
-        unsigned long motor_seq, task_seq;
-        
-        pthread_mutex_lock(&g_joint_state.mutex);
-        memcpy(state, g_joint_state.joints, sizeof(state));
-        motor_seq = g_joint_state.seq_num;
-        pthread_mutex_unlock(&g_joint_state.mutex);
-        
-        pthread_mutex_lock(&g_desired_state.mutex);
-        memcpy(desired, g_desired_state.desired, sizeof(desired));
-        task_seq = g_desired_state.seq_num;
-        pthread_mutex_unlock(&g_desired_state.mutex);
-        
-        /* Display state (overwrite previous line) */
-        printf("\r[DISP]  t=%.2fs | ", elapsed);
-        printf("J1: %.3f/%.3f | ", state[0].th, desired[0].th);
-        printf("J2: %.3f/%.3f | ", state[1].th, desired[1].th);
-        printf("J3: %.3f/%.3f | ", state[2].th, desired[2].th);
-        printf("seq: M=%lu T=%lu     ", motor_seq, task_seq);
-        fflush(stdout);
-        
-        g_display_cycles++;
-        
-        /* Sleep until next cycle */
-        next_time += loop_period;
-        double sleep_time = next_time - get_time();
-        if (sleep_time > 0) {
-            sleep_us((unsigned int)(sleep_time * 1e6));
-        }
-    }
-    
-    printf("\n[DISP]  Display stopped after %lu cycles\n", g_display_cycles);
-    return NULL;
-}
-
-/*============================================================================
- * Main Program
- *============================================================================*/
-
-/**
- * \brief Signal handler for clean shutdown
- */
-void signal_handler(int sig) {
-    (void)sig;
-    g_running = 0;
-}
-
-/**
- * \brief Initialize shared memory structures
- */
-void init_shared_memory(void) {
-    /* Initialize joint state shared memory */
-    pthread_mutex_init(&g_joint_state.mutex, NULL);
-    g_joint_state.timestamp = 0.0;
-    g_joint_state.seq_num = 0;
-    memset(g_joint_state.joints, 0, sizeof(g_joint_state.joints));
-    
-    /* Initialize desired state shared memory */
-    pthread_mutex_init(&g_desired_state.mutex, NULL);
-    g_desired_state.timestamp = 0.0;
-    g_desired_state.seq_num = 0;
-    g_desired_state.new_command = 0;
-    memset(g_desired_state.desired, 0, sizeof(g_desired_state.desired));
-    
-    /* Initialize synchronization semaphores */
-    init_sync_sem(&g_motor_sync);
-    init_sync_sem(&g_task_sync);
-}
-
-/**
- * \brief Main function demonstrating multi-process real-time communication
+ * \brief Main function demonstrating SL IPC architecture
  */
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    
-    pthread_t motor_thread, task_thread, disp_thread;
     
     printf("=================================================\n");
-    printf("SL Library Example: Real-Time IPC\n");
-    printf("=================================================\n\n");
+    printf("SL Library Example: Real-Time IPC Architecture\n");
+    printf("=================================================\n");
     
-    printf("This example demonstrates the real-time inter-process\n");
-    printf("communication architecture used in SL robot control.\n\n");
+    /* ----------------------------------------------------------------
+     * Example 1: SL Servo Architecture Overview
+     * ----------------------------------------------------------------
+     */
     
-    printf("Three concurrent processes communicate via shared memory:\n");
-    printf("  - Motor Servo:  %4d Hz (control loop)\n", MOTOR_SERVO_RATE);
-    printf("  - Task Servo:   %4d Hz (trajectory)\n", TASK_SERVO_RATE);
-    printf("  - Display:      %4d Hz (visualization)\n\n", DISPLAY_RATE);
+    printf("\n--- Example 1: SL Servo Architecture ---\n");
     
-    printf("Running for %d seconds...\n\n", RUN_TIME_SECONDS);
+    printf("\nSL uses multiple concurrent processes (servos):\n");
+    printf("\n  Servo Name          Typical Rate  Purpose\n");
+    printf("  ----------------------------------------------------------\n");
+    printf("  Motor Servo         %4d Hz      Low-level motor control\n", MOTOR_SERVO_RATE);
+    printf("  Simulation Servo    %4d Hz      Physics simulation\n", MOTOR_SERVO_RATE);
+    printf("  Task Servo          %4d Hz       Trajectory/task execution\n", TASK_SERVO_RATE);
+    printf("  Vision Servo        %4d Hz       Camera processing\n", DISPLAY_RATE);
+    printf("  OpenGL Servo        %4d Hz        3D visualization\n", DISPLAY_RATE);
+    printf("  ROS Servo           Variable     ROS communication\n");
     
-    /* Set up signal handler for clean shutdown */
-    signal(SIGINT, signal_handler);
+    /* ----------------------------------------------------------------
+     * Example 2: Shared Memory Structures
+     * ----------------------------------------------------------------
+     */
     
-    /* Initialize shared memory */
-    init_shared_memory();
+    printf("\n--- Example 2: SL Shared Memory Structures ---\n");
     
-    /* Create threads (in real SL, these would be separate processes) */
-    pthread_create(&motor_thread, NULL, motor_servo_thread, NULL);
-    pthread_create(&task_thread, NULL, task_servo_thread, NULL);
-    pthread_create(&disp_thread, NULL, display_thread, NULL);
+    printf("\nKey shared memory structures (from SL_shared_memory.h):\n");
     
-    /* Run for specified time */
-    sleep(RUN_TIME_SECONDS);
+    printf("\n  smJointStates - Current joint state\n");
+    printf("    - sm_sem: Semaphore for thread-safe access\n");
+    printf("    - ts: Timestamp\n");
+    printf("    - joint_state[]: Array of SL_fJstate (float version)\n");
     
-    /* Signal shutdown */
-    g_running = 0;
+    printf("\n  smJointDesStates - Desired joint state\n");
+    printf("    - sm_sem: Semaphore\n");
+    printf("    - ts: Timestamp\n");
+    printf("    - joint_des_state[]: Array of SL_fDJstate\n");
     
-    /* Signal semaphores to unblock waiting threads */
-    signal_sync_sem(&g_motor_sync);
-    signal_sync_sem(&g_task_sync);
+    printf("\n  smBaseState - Floating base position\n");
+    printf("    - sm_sem: Semaphore\n");
+    printf("    - ts: Timestamp\n");
+    printf("    - state[]: Array of SL_fCstate\n");
     
-    /* Wait for threads to finish */
-    pthread_join(motor_thread, NULL);
-    pthread_join(task_thread, NULL);
-    pthread_join(disp_thread, NULL);
+    printf("\n  smBaseOrient - Floating base orientation\n");
+    printf("    - sm_sem: Semaphore\n");
+    printf("    - ts: Timestamp\n");
+    printf("    - orient[]: Array of SL_fquat\n");
+    
+    printf("\n  smMessage - Inter-servo messaging\n");
+    printf("    - sm_sem: Semaphore\n");
+    printf("    - n_msgs: Number of messages\n");
+    printf("    - name[]: Message names\n");
+    printf("    - buf[]: Message data buffer\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 3: Semaphore Synchronization
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 3: SL Synchronization Semaphores ---\n");
+    
+    printf("\nSL uses semaphores for servo synchronization:\n");
+    printf("  sm_motor_servo_sem        - Motor servo timing\n");
+    printf("  sm_task_servo_sem         - Task servo timing\n");
+    printf("  sm_simulation_servo_sem   - Simulation servo timing\n");
+    printf("  sm_vision_servo_sem       - Vision servo timing\n");
+    printf("  sm_openGL_servo_sem       - OpenGL servo timing\n");
+    printf("  sm_ros_servo_sem          - ROS servo timing\n");
+    
+    printf("\nData-ready semaphores:\n");
+    printf("  sm_joint_des_state_ready_sem - New desired state available\n");
+    printf("  sm_raw_blobs_ready_sem       - New vision blobs available\n");
+    printf("  sm_user_graphics_ready_sem   - User graphics data ready\n");
+    
+    printf("\nMessage-ready semaphores:\n");
+    printf("  sm_task_message_ready_sem        - Message for task servo\n");
+    printf("  sm_motor_message_ready_sem       - Message for motor servo\n");
+    printf("  sm_simulation_message_ready_sem  - Message for sim servo\n");
+    printf("  sm_openGL_message_ready_sem      - Message for openGL servo\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 4: Real-Time Mutex (SL_rt_mutex)
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 4: SL Real-Time Mutex (SL_rt_mutex.h) ---\n");
+    
+    printf("\nSL provides cross-platform RT mutex wrappers:\n");
+    printf("  - Uses Xenomai mutexes on PREEMPT-RT/Xenomai\n");
+    printf("  - Falls back to pthread mutexes otherwise\n");
+    
+    printf("\nMutex functions:\n");
+    printf("  sl_rt_mutex_init(sl_rt_mutex* mutex)\n");
+    printf("  sl_rt_mutex_lock(sl_rt_mutex* mutex)\n");
+    printf("  sl_rt_mutex_trylock(sl_rt_mutex* mutex)\n");
+    printf("  sl_rt_mutex_unlock(sl_rt_mutex* mutex)\n");
+    printf("  sl_rt_mutex_destroy(sl_rt_mutex* mutex)\n");
+    
+    printf("\nCondition variable functions:\n");
+    printf("  sl_rt_cond_init(sl_rt_cond* cond)\n");
+    printf("  sl_rt_cond_wait(sl_rt_cond* cond, sl_rt_mutex* mutex)\n");
+    printf("  sl_rt_cond_timedwait(sl_rt_cond* cond, sl_rt_mutex* mutex, timeout)\n");
+    printf("  sl_rt_cond_signal(sl_rt_cond* cond)\n");
+    printf("  sl_rt_cond_broadcast(sl_rt_cond* cond)\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 5: Message Passing
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 5: Inter-Servo Message Passing ---\n");
+    
+    printf("\nSL provides message passing functions:\n");
+    printf("  sendMessageTaskServo(char *message, void *buf, int n_bytes)\n");
+    printf("  sendMessageMotorServo(char *message, void *buf, int n_bytes)\n");
+    printf("  sendMessageSimulationServo(char *message, void *buf, int n_bytes)\n");
+    printf("  sendMessageOpenGLServo(char *message, void *buf, int n_bytes)\n");
+    printf("  sendMessageVisionServo(char *message, void *buf, int n_bytes)\n");
+    printf("  sendMessageROSServo(char *message, void *buf, int n_bytes)\n");
+    
+    printf("\nUsage example (from task servo to motor servo):\n");
+    printf("  char msg_name[] = \"setGains\";\n");
+    printf("  double gains[3] = {100.0, 20.0, 0.1};\n");
+    printf("  sendMessageMotorServo(msg_name, gains, sizeof(gains));\n");
+    
+    printf("\nReceiving messages (in servo loop):\n");
+    printf("  if (semTake(sm_task_message_ready_sem, NO_WAIT) == OK) {\n");
+    printf("    // Process messages in sm_task_message\n");
+    printf("    // Match message name and handle accordingly\n");
+    printf("  }\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 6: Typical Data Flow
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 6: SL Data Flow Between Servos ---\n");
+    
+    printf("\nTypical control loop data flow:\n");
+    printf("\n  1. Motor Servo (or Simulation Servo):\n");
+    printf("     - Reads joint_des_state from shared memory\n");
+    printf("     - Computes motor commands (or physics sim)\n");
+    printf("     - Writes joint_state to shared memory\n");
+    printf("     - Signals sm_task_servo_sem\n");
+    
+    printf("\n  2. Task Servo:\n");
+    printf("     - Waits on sm_task_servo_sem\n");
+    printf("     - Reads joint_state from shared memory\n");
+    printf("     - Runs task/trajectory computation\n");
+    printf("     - Writes joint_des_state to shared memory\n");
+    printf("     - Signals sm_joint_des_state_ready_sem\n");
+    
+    printf("\n  3. OpenGL Servo:\n");
+    printf("     - Waits on sm_openGL_servo_sem (60 Hz trigger)\n");
+    printf("     - Reads joint_state from shared memory\n");
+    printf("     - Updates 3D visualization\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 7: Shared Memory Initialization
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 7: Shared Memory Initialization ---\n");
+    
+    printf("\nSL shared memory is initialized with init_shared_memory():\n");
+    printf("  - Called during SL startup\n");
+    printf("  - Creates all shared memory segments\n");
+    printf("  - Initializes all semaphores\n");
+    printf("  - Returns TRUE on success\n");
+    
+    printf("\nInitialization sequence:\n");
+    printf("  1. init_shared_memory() - Create SM and semaphores\n");
+    printf("  2. Start motor/simulation servo\n");
+    printf("  3. Start task servo\n");
+    printf("  4. Start openGL servo\n");
+    printf("  5. Start additional servos as needed\n");
+    
+    printf("\nKey shared memory objects created:\n");
+    printf("  - sm_joint_state (smJointStates)\n");
+    printf("  - sm_joint_des_state (smJointDesStates)\n");
+    printf("  - sm_joint_sim_state (smJointSimStates)\n");
+    printf("  - sm_base_state (smBaseState)\n");
+    printf("  - sm_base_orient (smBaseOrient)\n");
+    printf("  - sm_cart_states (smCartStates)\n");
+    printf("  - sm_misc_sensor (smMiscSensors)\n");
+    printf("  - sm_contacts (smContacts)\n");
+    printf("  - sm_user_graphics (smUserGraphics)\n");
+    printf("  - sm_oscilloscope (smOscilloscope)\n");
+    
+    /* ----------------------------------------------------------------
+     * Example 8: Real-Time Considerations
+     * ----------------------------------------------------------------
+     */
+    
+    printf("\n--- Example 8: Real-Time Considerations ---\n");
+    
+    printf("\nFor deterministic real-time performance:\n");
+    
+    printf("\n  PREEMPT-RT or Xenomai kernel:\n");
+    printf("    - Provides deterministic scheduling\n");
+    printf("    - Sub-millisecond latency\n");
+    printf("    - Priority inheritance for mutexes\n");
+    
+    printf("\n  Memory locking:\n");
+    printf("    - mlockall(MCL_CURRENT | MCL_FUTURE)\n");
+    printf("    - Prevents page faults during RT operation\n");
+    
+    printf("\n  Thread priorities (SCHED_FIFO):\n");
+    printf("    - Motor servo: Highest priority\n");
+    printf("    - Task servo: High priority\n");
+    printf("    - Vision servo: Medium priority\n");
+    printf("    - OpenGL servo: Lower priority\n");
+    
+    printf("\n  Lock-free techniques:\n");
+    printf("    - Double buffering where possible\n");
+    printf("    - Atomic operations for flags\n");
+    printf("    - Minimize critical section duration\n");
+    
+    /* ----------------------------------------------------------------
+     * Summary
+     * ----------------------------------------------------------------
+     */
     
     printf("\n=================================================\n");
-    printf("Statistics\n");
+    printf("Summary: SL Real-Time IPC Architecture\n");
     printf("=================================================\n");
-    printf("Motor servo: %lu cycles (expected: %d)\n", 
-           g_motor_cycles, MOTOR_SERVO_RATE * RUN_TIME_SECONDS);
-    printf("Task servo:  %lu cycles (expected: %d)\n", 
-           g_task_cycles, TASK_SERVO_RATE * RUN_TIME_SECONDS);
-    printf("Display:     %lu cycles (expected: %d)\n", 
-           g_display_cycles, DISPLAY_RATE * RUN_TIME_SECONDS);
-    
-    printf("\n=================================================\n");
-    printf("Summary: Real-Time IPC in SL\n");
-    printf("=================================================\n");
-    printf("\nKey concepts demonstrated:\n");
-    printf("  - Shared memory for inter-process data exchange\n");
-    printf("  - Mutexes for thread-safe access\n");
-    printf("  - Condition variables for synchronization\n");
-    printf("  - Timestamp-based data freshness checking\n");
-    printf("  - Sequence numbers for ordering\n");
-    printf("\nSL IPC architecture:\n");
-    printf("  - Motor servo (highest priority): 1000 Hz\n");
-    printf("  - Simulation servo: physics simulation\n");
-    printf("  - Task servo: trajectory generation\n");
-    printf("  - Vision servo: camera processing\n");
-    printf("  - OpenGL servo: visualization\n");
+    printf("\nKey concepts:\n");
+    printf("  - Multiple concurrent servo processes\n");
+    printf("  - Shared memory for data exchange (SL_shared_memory.h)\n");
+    printf("  - Semaphores for synchronization\n");
+    printf("  - Message passing for commands\n");
+    printf("  - RT mutex wrappers (SL_rt_mutex.h)\n");
+    printf("\nSL servo architecture:\n");
+    printf("  - Motor servo (1000 Hz): Hardware interface\n");
+    printf("  - Simulation servo: Physics simulation\n");
+    printf("  - Task servo (500 Hz): Trajectory/control\n");
+    printf("  - Vision servo: Camera processing\n");
+    printf("  - OpenGL servo (60 Hz): Visualization\n");
     printf("  - ROS servo: ROS communication\n");
     printf("\nReal-time considerations:\n");
-    printf("  - PREEMPT-RT or Xenomai for deterministic timing\n");
-    printf("  - Priority inheritance mutexes\n");
-    printf("  - Lock-free techniques where possible\n");
-    printf("  - Memory locking (mlockall)\n");
+    printf("  - Use PREEMPT-RT or Xenomai\n");
+    printf("  - Lock memory with mlockall()\n");
+    printf("  - Set appropriate thread priorities\n");
+    printf("  - Minimize blocking in RT threads\n");
     printf("\n");
     
     return 0;

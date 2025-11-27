@@ -18,110 +18,18 @@
   - SL_quat: Quaternion orientation representation
   - SL_link: Link parameters for rigid body dynamics
 
-  This is a standalone example that defines the necessary structures locally.
-  In actual SL usage, these would be included from SL.h.
+  Compile with:
+    gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR -o 01_data_structures \
+        01_data_structures.c -lSLcommon -lutility -lm
 
   ============================================================================*/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
+// SL general includes of system headers
+#include "SL_system_headers.h"
 
-/* 
- * SL Data Structure Definitions
- * 
- * These structures are defined in SL.h in the actual library.
- * They are replicated here for standalone example compilation.
- */
-
-#define N_CART 3
-#define N_QUAT 4
-#define START_INDEX 1
-
-/* Cartesian coordinate indices (1-indexed) */
-#define _X_ (0+START_INDEX)
-#define _Y_ (1+START_INDEX)
-#define _Z_ (2+START_INDEX)
-
-/* Euler angle indices */
-#define _A_ (0+START_INDEX)
-#define _B_ (1+START_INDEX)
-#define _G_ (2+START_INDEX)
-
-/* Quaternion indices */
-#define _Q0_ 1
-#define _Q1_ 2
-#define _Q2_ 3
-#define _Q3_ 4
-
-/**
- * \brief Joint space state structure
- * 
- * Holds the current state of a robot joint including position,
- * velocity, acceleration, and torque information.
- */
-typedef struct {
-  double   th;   /**< theta - joint position */
-  double   thd;  /**< theta-dot - joint velocity */
-  double   thdd; /**< theta-dot-dot - joint acceleration */
-  double   ufb;  /**< feedback portion of command */
-  double   u;    /**< total torque command */
-  double   load; /**< sensed torque */
-} SL_Jstate;
-
-/**
- * \brief Desired joint state structure
- * 
- * Holds the desired/target values for joint control.
- */
-typedef struct {
-  double   th;   /**< desired theta */
-  double   thd;  /**< desired theta-dot */
-  double   thdd; /**< desired theta-dot-dot */
-  double   uff;  /**< feedforward torque command */
-  double   uex;  /**< externally imposed torque */
-} SL_DJstate;
-
-/**
- * \brief Cartesian state structure
- * 
- * Holds 3D Cartesian position, velocity, and acceleration.
- */
-typedef struct {
-  double   x[N_CART+1];    /**< Position [x,y,z] */
-  double   xd[N_CART+1];   /**< Velocity */
-  double   xdd[N_CART+1];  /**< Acceleration */
-} SL_Cstate;
-
-/**
- * \brief Quaternion orientation structure
- * 
- * Holds quaternion representation of orientation along with
- * angular velocities and accelerations.
- */
-typedef struct {
-  double   q[N_QUAT+1];    /**< Position [q0,q1,q2,q3] */
-  double   qd[N_QUAT+1];   /**< Velocity */
-  double   qdd[N_QUAT+1];  /**< Acceleration */
-  double   ad[N_CART+1];   /**< Angular Velocity [alpha,beta,gamma] */
-  double   add[N_CART+1];  /**< Angular Acceleration */
-} SL_quat;
-
-/**
- * \brief Link parameters structure
- * 
- * Contains rigid body dynamics parameters for a robot link.
- */
-typedef struct {
-  double   m;                              /**< Mass */
-  double   mcm[N_CART+1];                  /**< Center of mass times mass */
-  double   inertia[N_CART+1][N_CART+1];    /**< Moment of inertia */
-  double   vis;                            /**< viscous friction term */
-  double   coul;                           /**< coulomb friction */
-  double   stiff;                          /**< spring stiffness */
-  double   cons;                           /**< constant term */
-} SL_link;
+// SL specific headers
+#include "SL.h"
+#include "utility.h"
 
 /**
  * \brief Print joint state information
@@ -370,7 +278,7 @@ int main(int argc, char **argv) {
     printf("  - SL_Cstate:  Cartesian state\n");
     printf("  - SL_quat:    Quaternion orientation\n");
     printf("  - SL_link:    Link dynamics parameters\n");
-    printf("\nIndex conventions:\n");
+    printf("\nIndex conventions (defined in SL.h):\n");
     printf("  - _X_, _Y_, _Z_ for Cartesian coordinates (1, 2, 3)\n");
     printf("  - _Q0_, _Q1_, _Q2_, _Q3_ for quaternion (1, 2, 3, 4)\n");
     printf("  - _A_, _B_, _G_ for Euler angles (1, 2, 3)\n");

@@ -1,10 +1,14 @@
 # SL Library Examples
 
-This directory contains examples demonstrating the key features and usage patterns of the SL (Simulation Lab) Core Libraries. These examples are designed to help you understand the library's data structures, algorithms, and best practices.
+This directory contains examples demonstrating the key features and usage patterns of the SL (Simulation Lab) Core Libraries. These examples use the actual SL library headers and link against the SL libraries.
 
-## Overview
+## Prerequisites
 
-The SL libraries provide essential functionality for robot control and simulation. These examples focus on the mathematical and algorithmic components that can be understood without the full robot simulation environment.
+These examples require a properly configured SL environment:
+- SL libraries built and installed
+- `$LAB_ROOT` environment variable set to the SL installation root
+- `$LAB_LIBDIR` environment variable set to the SL library directory
+- `$LAB_INCLUDES` environment variable set to the SL include directory
 
 ## Examples
 
@@ -23,15 +27,17 @@ Key concepts covered:
 - Index conventions (`_X_`, `_Y_`, `_Z_`, etc.)
 - Units and typical value ranges
 
+**Libraries used:** SLcommon, utility
+
 ### 02_quaternion_operations.c
 **Quaternion and Rotation Operations**
 
-Demonstrates quaternion math for 3D orientation handling:
-- Euler angle to quaternion conversion (`eulerToQuat`, `eulerToQuatInv`)
-- Quaternion to Euler angle conversion (`quatToEuler`, `quatToEulerInv`)
-- Quaternion to rotation matrix (`quatToRotMat`, `quatToRotMatInv`)
-- Quaternion derivatives (`quatDerivatives`)
-- Quaternion error computation (`quatError`, `quatErrorVector`)
+Demonstrates quaternion math for 3D orientation handling using SL library functions:
+- `eulerToQuat`, `eulerToQuatInv`: Euler angles to quaternion conversion
+- `quatToEuler`, `quatToEulerInv`: Quaternion to Euler angle conversion
+- `quatToRotMat`, `quatToRotMatInv`: Quaternion to rotation matrix
+- `quatDerivatives`: Compute quaternion derivatives from angular velocity
+- `quatError`, `quatErrorVector`: Quaternion error computation
 
 Key concepts covered:
 - SL's Euler angle convention (a-b-g, X-Y-Z rotations)
@@ -39,97 +45,116 @@ Key concepts covered:
 - Angular velocity representation
 - Orientation error for feedback control
 
+**Libraries used:** SLcommon, utility
+
 ### 03_min_jerk_trajectory.c
 **Minimum Jerk Trajectory Generation**
 
 Demonstrates smooth trajectory planning for point-to-point movements:
 - 5th order polynomial trajectory generation
 - Position, velocity, and acceleration profiles
-- Multi-DOF coordinated movements
-- Trajectory blending from non-zero initial conditions
+- Multi-DOF coordinated movements using SL_DJstate arrays
+- Trajectory computation similar to SL's goto_task
 
 Key concepts covered:
 - Minimum jerk criterion for smooth motion
 - Bell-shaped velocity profiles
-- Iterative trajectory computation (as used in SL's goto_task)
-- Servo-rate trajectory updates
+- Iterative trajectory computation
+- Using SL data structures for trajectory representation
+
+**Libraries used:** SLcommon, SLtask, utility
 
 ### 04_signal_filtering.c
 **Signal Filtering with Butterworth Filters**
 
-Demonstrates the low-pass filtering utilities:
-- 2nd order Butterworth filter implementation
+Demonstrates the low-pass filtering utilities from SL_filters:
 - Filter structure and initialization
-- Effect of cutoff frequency on smoothing
-- Multi-channel filtering
-- Step response characteristics
+- Using the `filt()` function for real-time filtering
+- Filter cutoff selection guidelines
+- Multi-channel filtering patterns
 
 Key concepts covered:
-- Difference equation implementation
+- 2nd order Butterworth filter implementation
 - Cutoff frequency selection
 - Trade-offs between smoothing and phase lag
-- Real-time filter processing
+- Integration with SL sensor processing
+
+**Libraries used:** SLcommon, utility
 
 ### 05_realtime_ipc.c
 **Real-Time Inter-Process Communication**
 
-Demonstrates the multi-process architecture used in SL robot control with PREEMPT-RT Linux:
-- Three concurrent processes (Motor Servo, Task Servo, Display)
-- Shared memory for data exchange
-- Mutex-protected access
-- Condition variables for synchronization
-- Sequence numbers and timestamps for data ordering
+Demonstrates the multi-process architecture used in SL robot control:
+- SL servo architecture (motor, task, simulation, vision, openGL, ROS)
+- Shared memory structures (smJointStates, smJointDesStates, etc.)
+- Semaphore synchronization between servos
+- Real-time mutex wrappers (SL_rt_mutex)
+- Message passing between servos
 
 Key concepts covered:
-- SL's servo architecture (motor, task, simulation, vision, openGL)
+- SL's concurrent servo architecture
 - Real-time communication patterns
 - Thread-safe shared memory access
 - Synchronization between processes running at different rates
 - Compatibility with PREEMPT-RT and Xenomai
 
+**Libraries used:** SLcommon, utility, pthread
+
 ## Building the Examples
 
-These examples are standalone and can be compiled without the full SL build environment.
+### Using CMake (Recommended)
 
-### Quick Start
+These examples can be built using the CMake build system:
 
 ```bash
 cd examples
-
-# Compile all examples
-gcc -Wall -o 01_data_structures 01_data_structures.c -lm
-gcc -Wall -o 02_quaternion_operations 02_quaternion_operations.c -lm
-gcc -Wall -o 03_min_jerk_trajectory 03_min_jerk_trajectory.c -lm
-gcc -Wall -o 04_signal_filtering 04_signal_filtering.c -lm
-gcc -Wall -o 05_realtime_ipc 05_realtime_ipc.c -lpthread -lm
-
-# Run examples
-./01_data_structures
-./02_quaternion_operations
-./03_min_jerk_trajectory
-./04_signal_filtering
-./05_realtime_ipc
+mkdir build
+cd build
+cmake ..
+make
 ```
 
-### With Optimization
+### Manual Compilation
+
+Each example can be compiled manually with the proper includes and libraries:
 
 ```bash
-gcc -O2 -Wall -o 01_data_structures 01_data_structures.c -lm
-```
+# Example: Compile data structures example
+gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR \
+    -o 01_data_structures 01_data_structures.c \
+    -lSLcommon -lutility -lm
 
-### Using with Full SL Environment
+# Example: Compile quaternion operations
+gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR \
+    -o 02_quaternion_operations 02_quaternion_operations.c \
+    -lSLcommon -lutility -lm
 
-When SL is properly installed with its dependencies:
+# Example: Compile min-jerk trajectory
+gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR \
+    -o 03_min_jerk_trajectory 03_min_jerk_trajectory.c \
+    -lSLcommon -lSLtask -lutility -lm
 
-```bash
-# Set up SL environment
-source <sl_install_path>/setup.sh
+# Example: Compile signal filtering
+gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR \
+    -o 04_signal_filtering 04_signal_filtering.c \
+    -lSLcommon -lutility -lm
 
-# Compile with SL libraries
-gcc -o example examples/01_data_structures.c -I$LAB_INCLUDES -L$LAB_LIBDIR -lSLcommon -lm
+# Example: Compile real-time IPC
+gcc -I$LAB_ROOT/include -I../include -L$LAB_LIBDIR \
+    -o 05_realtime_ipc 05_realtime_ipc.c \
+    -lSLcommon -lutility -lpthread -lm
 ```
 
 ## Key Concepts
+
+### SL Headers
+
+The examples use the following SL headers:
+- `SL.h`: Core data structures and definitions
+- `SL_common.h`: Common utility functions (quaternion operations, etc.)
+- `SL_filters.h`: Signal filtering structures and functions
+- `SL_shared_memory.h`: Shared memory structures for IPC
+- `SL_rt_mutex.h`: Real-time mutex wrappers
 
 ### Index Conventions
 
@@ -154,6 +179,13 @@ Standard SI units are used throughout:
 - Torque: Newton-meters (Nm)
 - Mass: kilograms (kg)
 - Inertia: kg·m²
+
+## SL Library Dependencies
+
+These examples link against the following SL libraries:
+- **SLcommon**: Common utilities, quaternion operations, filtering
+- **SLtask**: Task servo functionality, trajectory generation
+- **utility**: Utility library (Matrix, Vector operations)
 
 ## Further Reading
 
