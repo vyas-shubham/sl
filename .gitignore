@@ -40,3 +40,4 @@ examples/02_quaternion_operations
 examples/03_min_jerk_trajectory
 examples/04_signal_filtering
 examples/05_realtime_ipc
+_codeql_detected_source_root
